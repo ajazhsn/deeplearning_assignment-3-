@@ -369,15 +369,15 @@ class Transformer(nn.Module):
         # 1. LOAD TOKENIZERS
         # ============================================================
 
-       try:
-          self.de_nlp = spacy.load("de_core_news_sm")
-      except:
-          self.de_nlp = spacy.blank("de")
-      
-      try:
-          self.en_nlp = spacy.load("en_core_web_sm")
-      except:
-          self.en_nlp = spacy.blank("en")
+        try:
+            self.de_nlp = spacy.load("de_core_news_sm")
+        except:
+            self.de_nlp = spacy.blank("de")
+        
+        try:
+            self.en_nlp = spacy.load("en_core_web_sm")
+        except:
+            self.en_nlp = spacy.blank("en")
 
         # ============================================================
         # 2. SPECIAL TOKENS
