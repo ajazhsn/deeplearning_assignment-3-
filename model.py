@@ -579,62 +579,41 @@ class Transformer(nn.Module):
     # ================================================================
     # INFERENCE
     # ================================================================
-    def infer(self, src_sentence: str) -> str:
+        def infer(self, src_sentence: str) -> str:
 
-      self.eval()
+          self.eval()
   
-      device = next(self.parameters()).device
+          device = next(self.parameters()).device
   
-      # Tokenize source sentence
-      tokens = [
-          tok.text.lower().strip()
-          for tok in self.de_nlp.tokenizer(src_sentence)
-      ]
-  
-      src_indices = (
-          [self.sos_idx]
-          + [self.src_stoi.get(tok, 0) for tok in tokens]
-          + [self.eos_idx]
-      )
-  
-      src = torch.tensor(
-          src_indices,
-          dtype=torch.long
-      ).unsqueeze(0).to(device)
-  
-      src_mask = make_src_mask(src, self.pad_idx)
-  
-      beam_size = 3
-      max_len = 150
-  
-      with torch.no_grad():
-  
-          memory = self.encode(src, src_mask)
-  
-          # Each beam: (sequence_tensor, score)
-          beams = [
-              (
-                  torch.tensor(
-                      [[self.sos_idx]],
-                      dtype=torch.long,
-                      device=device
-                  ),
-                  0.0
-              )
+          tokens = [
+              tok.text.lower().strip()
+              for tok in self.de_nlp.tokenizer(src_sentence)
           ]
   
-          completed = []
+          src_indices = (
+              [self.sos_idx]
+              + [self.src_stoi.get(t, 0) for t in tokens]
+              + [self.eos_idx]
+          )
   
-          for _ in range(max_len):
+          src = torch.tensor(
+              src_indices,
+              dtype=torch.long
+          ).unsqueeze(0).to(device)
   
-              new_beams = []
+          src_mask = make_src_mask(src, self.pad_idx)
   
-              for ys, score in beams:
+          ys = torch.tensor(
+              [[self.sos_idx]],
+              dtype=torch.long,
+              device=device
+          )
   
-                  # Stop expanding completed sequences
-                  if ys[0, -1].item() == self.eos_idx:
-                      completed.append((ys, score))
-                      continue
+          with torch.no_grad():
+  
+              memory = self.encode(src, src_mask)
+  
+              for _ in range(150):
   
                   tgt_mask = make_tgt_mask(
                       ys,
@@ -648,60 +627,26 @@ class Transformer(nn.Module):
                       tgt_mask
                   )
   
-                  log_probs = torch.log_softmax(
-                      logits[:, -1, :],
-                      dim=-1
+                  next_tok = logits[:, -1, :].argmax(
+                      dim=-1,
+                      keepdim=True
                   )
   
-                  topk_log_probs, topk_indices = torch.topk(
-                      log_probs,
-                      beam_size,
-                      dim=-1
-                  )
+                  ys = torch.cat([ys, next_tok], dim=1)
   
-                  for k in range(beam_size):
+                  if next_tok.item() == self.eos_idx:
+                      break
   
-                      next_tok = topk_indices[0, k].view(1, 1)
+          result = []
   
-                      new_seq = torch.cat(
-                          [ys, next_tok],
-                          dim=1
-                      )
+          for idx in ys.squeeze(0).tolist()[1:]:
   
-                      new_score = score + topk_log_probs[0, k].item()
-  
-                      new_beams.append(
-                          (new_seq, new_score)
-                      )
-  
-              # Keep best beams
-              beams = sorted(
-                  new_beams,
-                  key=lambda x: x[1],
-                  reverse=True
-              )[:beam_size]
-  
-              if len(beams) == 0:
+              if idx == self.eos_idx:
                   break
   
-          completed.extend(beams)
+              if idx != self.pad_idx:
+                  result.append(
+                      self.tgt_itos.get(idx, "<unk>")
+                  )
   
-          best_seq = sorted(
-              completed,
-              key=lambda x: x[1],
-              reverse=True
-          )[0][0]
-  
-      result = []
-  
-      for idx in best_seq.squeeze(0).tolist()[1:]:
-  
-          if idx == self.eos_idx:
-              break
-  
-          if idx != self.pad_idx:
-              result.append(
-                  self.tgt_itos.get(idx, "<unk>")
-            )
-
-      return " ".join(result)
+          return " ".join(result)
