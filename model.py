@@ -590,7 +590,14 @@ class Transformer(nn.Module):
             for _ in range(max_len):
                 tgt_mask = make_tgt_mask(ys, self.pad_idx).to(device)
                 logits   = self.decode(memory, src_mask, ys, tgt_mask)
-                next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                temperature = 0.9
+
+                scaled_logits = logits[:, -1, :] / temperature
+                
+                next_tok = scaled_logits.argmax(
+                    dim=-1,
+                    keepdim=True
+                )
                 ys       = torch.cat([ys, next_tok], dim=1)
 
                 if next_tok.item() == self.eos_idx:
