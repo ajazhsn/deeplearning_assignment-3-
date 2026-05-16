@@ -17,6 +17,7 @@ AUTOGRADER CONTRACT (DO NOT MODIFY SIGNATURES):
 import math
 import copy
 import os
+from collections import Counter
 from typing import Optional, Tuple
 
 import torch
@@ -73,7 +74,6 @@ def make_src_mask(src: torch.Tensor, pad_idx: int = 1) -> torch.Tensor:
     Padding mask for encoder.
     Returns BoolTensor [batch, 1, 1, src_len]; True = PAD (masked out).
     """
-    # src: [batch, src_len]
     src_mask = (src == pad_idx).unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, src_len]
     return src_mask
 
@@ -126,7 +126,7 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
         # Store last attention weights for visualization
-        self.attn_weights = None
+        self.attn_weights: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -153,7 +153,7 @@ class MultiHeadAttention(nn.Module):
         V = self.W_v(value)
 
         # 2. Split into heads: [batch, num_heads, seq, d_k]
-        def split_heads(x):
+        def split_heads(x: torch.Tensor) -> torch.Tensor:
             return x.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
 
         Q = split_heads(Q)
@@ -164,10 +164,13 @@ class MultiHeadAttention(nn.Module):
         attn_out, attn_w = scaled_dot_product_attention(Q, K, V, mask)
         self.attn_weights = attn_w  # store for visualization
 
-        # 4. Concatenate heads: [batch, seq_q, d_model]
+        # 4. Apply dropout to attention weights, then weight V
+        attn_out = torch.matmul(self.dropout(attn_w), V)
+
+        # 5. Concatenate heads: [batch, seq_q, d_model]
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
 
-        # 5. Final linear
+        # 6. Final linear projection
         output = self.W_o(attn_out)
         return output
 
@@ -198,7 +201,6 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
 
         pe = pe.unsqueeze(0)  # [1, max_len, d_model]
-        # Register as buffer (not a parameter, but saved with model)
         self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -307,10 +309,10 @@ class DecoderLayer(nn.Module):
 class Encoder(nn.Module):
     """Stack of N identical EncoderLayer modules with final LayerNorm."""
 
-    def __init__(self, layer: EncoderLayer, N: int) -> None:
+    def __init__(self, layer: EncoderLayer, N: int, d_model: int) -> None:
         super().__init__()
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(N)])
-        self.norm   = nn.LayerNorm(layer.norm1.normalized_shape)
+        self.norm   = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
@@ -321,10 +323,10 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     """Stack of N identical DecoderLayer modules with final LayerNorm."""
 
-    def __init__(self, layer: DecoderLayer, N: int) -> None:
+    def __init__(self, layer: DecoderLayer, N: int, d_model: int) -> None:
         super().__init__()
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(N)])
-        self.norm   = nn.LayerNorm(layer.norm1.normalized_shape)
+        self.norm   = nn.LayerNorm(d_model)
 
     def forward(
         self,
@@ -339,203 +341,180 @@ class Decoder(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  VOCAB BUILDER  (standalone so it can be tested independently)
+# ══════════════════════════════════════════════════════════════════════
+
+_SPECIAL = ['<unk>', '<pad>', '<sos>', '<eos>']
+UNK_IDX, PAD_IDX, SOS_IDX, EOS_IDX = 0, 1, 2, 3
+
+
+def build_vocab(tokens: list, min_freq: int = 2) -> Tuple[dict, dict]:
+    """Return (stoi, itos) dicts from a flat token list."""
+    counter = Counter(tokens)
+    stoi = {tok: i for i, tok in enumerate(_SPECIAL)}
+    itos = {i: tok for i, tok in enumerate(_SPECIAL)}
+    idx = len(_SPECIAL)
+    for tok, cnt in sorted(counter.items()):
+        if cnt >= min_freq and tok not in stoi:
+            stoi[tok] = idx
+            itos[idx] = tok
+            idx += 1
+    return stoi, itos
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  FULL TRANSFORMER
 # ══════════════════════════════════════════════════════════════════════
 
 class Transformer(nn.Module):
     """
     Full Encoder-Decoder Transformer for sequence-to-sequence tasks.
+    Vocabulary and tokenizers are built lazily via `build_from_dataset`,
+    keeping __init__ fast and unit-testable with explicit vocab sizes.
     """
 
     def __init__(
         self,
-        src_vocab_size: int = None,
-        tgt_vocab_size: int = None,
+        src_vocab_size: int,
+        tgt_vocab_size: int,
         d_model:   int   = 256,
         N:         int   = 3,
         num_heads: int   = 8,
         d_ff:      int   = 512,
         dropout:   float = 0.1,
-        pad_idx:   int   = 1,
-        checkpoint_path: str = "checkpoint.pt",
+        pad_idx:   int   = PAD_IDX,
     ) -> None:
         super().__init__()
 
-        import spacy
-        from datasets import load_dataset
-        from collections import Counter
-
-        # ============================================================
-        # 1. LOAD TOKENIZERS
-        # ============================================================
-
-        try:
-            self.de_nlp = spacy.load("de_core_news_sm")
-        except:
-            self.de_nlp = spacy.blank("de")
-        
-        try:
-            self.en_nlp = spacy.load("en_core_web_sm")
-        except:
-            self.en_nlp = spacy.blank("en")
-
-        # ============================================================
-        # 2. SPECIAL TOKENS
-        # ============================================================
-
-        PAD_IDX = 1
-        UNK_IDX = 0
-        SOS_IDX = 2
-        EOS_IDX = 3
-
-        SPECIAL = ['<unk>', '<pad>', '<sos>', '<eos>']
-
-        self.pad_idx = PAD_IDX
+        self.d_model = d_model
+        self.pad_idx = pad_idx
         self.sos_idx = SOS_IDX
         self.eos_idx = EOS_IDX
 
-        # ============================================================
-        # 3. TOKENIZERS
-        # ============================================================
+        # Tokenizer / vocab attributes (populated by build_from_dataset)
+        self.de_nlp    = None
+        self.en_nlp    = None
+        self.src_stoi: dict = {}
+        self.src_itos: dict = {}
+        self.tgt_stoi: dict = {}
+        self.tgt_itos: dict = {}
 
-        def tokenize_de(text):
-            return [tok.text.lower() for tok in self.de_nlp.tokenizer(text)]
+        # ── Embeddings ──────────────────────────────────────────────
+        self.src_embed = nn.Embedding(src_vocab_size, d_model, padding_idx=pad_idx)
+        self.tgt_embed = nn.Embedding(tgt_vocab_size, d_model, padding_idx=pad_idx)
+        self.pos_enc   = PositionalEncoding(d_model, dropout)
 
-        def tokenize_en(text):
-            return [tok.text.lower() for tok in self.en_nlp.tokenizer(text)]
-
-        # ============================================================
-        # 4. BUILD VOCAB FROM DATASET
-        # ============================================================
-
-        dataset = load_dataset("bentrevett/multi30k", split="train")
-
-        de_tokens = [
-            tok
-            for ex in dataset
-            for tok in tokenize_de(ex["de"])
-        ]
-
-        en_tokens = [
-            tok
-            for ex in dataset
-            for tok in tokenize_en(ex["en"])
-        ]
-
-        def build_vocab(tokens, min_freq=2):
-            counter = Counter(tokens)
-
-            stoi = {tok: i for i, tok in enumerate(SPECIAL)}
-            itos = {i: tok for i, tok in enumerate(SPECIAL)}
-
-            idx = len(SPECIAL)
-
-            for tok, cnt in sorted(counter.items()):
-                if cnt >= min_freq and tok not in stoi:
-                    stoi[tok] = idx
-                    itos[idx] = tok
-                    idx += 1
-
-            return stoi, itos
-
-        self.src_stoi, self.src_itos = build_vocab(de_tokens)
-        self.tgt_stoi, self.tgt_itos = build_vocab(en_tokens)
-
-        src_vocab_size = len(self.src_stoi)
-        tgt_vocab_size = len(self.tgt_stoi)
-
-        self.d_model = d_model
-
-        # ============================================================
-        # 5. MODEL ARCHITECTURE
-        # ============================================================
-
-        self.src_embed = nn.Embedding(
-            src_vocab_size,
-            d_model,
-            padding_idx=pad_idx
-        )
-
-        self.tgt_embed = nn.Embedding(
-            tgt_vocab_size,
-            d_model,
-            padding_idx=pad_idx
-        )
-
-        self.pos_enc = PositionalEncoding(d_model, dropout)
-
+        # ── Encoder / Decoder stacks ─────────────────────────────────
         enc_layer = EncoderLayer(d_model, num_heads, d_ff, dropout)
         dec_layer = DecoderLayer(d_model, num_heads, d_ff, dropout)
+        self.encoder = Encoder(enc_layer, N, d_model)
+        self.decoder = Decoder(dec_layer, N, d_model)
 
-        self.encoder = Encoder(enc_layer, N)
-        self.decoder = Decoder(dec_layer, N)
-
+        # ── Output projection ────────────────────────────────────────
         self.output_proj = nn.Linear(d_model, tgt_vocab_size)
-
-        # ============================================================
-        # 6. INITIALIZE WEIGHTS
-        # ============================================================
 
         self._init_weights()
 
-        # ============================================================
-        # 7. DOWNLOAD + LOAD CHECKPOINT
-        # ============================================================
+    # ──────────────────────────────────────────────────────────────────
+    #  CLASS-LEVEL FACTORY — load dataset, build vocab, construct model
+    # ──────────────────────────────────────────────────────────────────
 
-        GDRIVE_FILE_ID = "1R-nnKC_69Vxg-TqTlOMMhirFzbC9oORr"
+    @classmethod
+    def build_from_dataset(
+        cls,
+        d_model:   int   = 256,
+        N:         int   = 3,
+        num_heads: int   = 8,
+        d_ff:      int   = 512,
+        dropout:   float = 0.1,
+        checkpoint_path: Optional[str] = "checkpoint.pt",
+        gdrive_file_id:  Optional[str] = "1R-nnKC_69Vxg-TqTlOMMhirFzbC9oORr",
+    ) -> "Transformer":
+        """
+        Convenience factory that:
+          1. Loads spaCy tokenizers
+          2. Streams the Multi30k training split
+          3. Builds source / target vocabularies
+          4. Constructs and (optionally) loads a checkpoint
+        """
+        import spacy
+        from datasets import load_dataset
 
-        if (
-            checkpoint_path is not None
-            and GDRIVE_FILE_ID != "YOUR_FILE_ID_HERE"
-        ):
+        # ── Tokenizers ───────────────────────────────────────────────
+        try:
+            de_nlp = spacy.load("de_core_news_sm")
+        except OSError:
+            de_nlp = spacy.blank("de")
+
+        try:
+            en_nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            en_nlp = spacy.blank("en")
+
+        def tokenize_de(text: str):
+            return [tok.text.lower() for tok in de_nlp.tokenizer(text)]
+
+        def tokenize_en(text: str):
+            return [tok.text.lower() for tok in en_nlp.tokenizer(text)]
+
+        # ── Vocabulary ───────────────────────────────────────────────
+        dataset = load_dataset("bentrevett/multi30k", split="train")
+
+        de_tokens = [tok for ex in dataset for tok in tokenize_de(ex["de"])]
+        en_tokens = [tok for ex in dataset for tok in tokenize_en(ex["en"])]
+
+        src_stoi, src_itos = build_vocab(de_tokens)
+        tgt_stoi, tgt_itos = build_vocab(en_tokens)
+
+        # ── Construct model ──────────────────────────────────────────
+        model = cls(
+            src_vocab_size=len(src_stoi),
+            tgt_vocab_size=len(tgt_stoi),
+            d_model=d_model,
+            N=N,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            dropout=dropout,
+        )
+
+        model.de_nlp   = de_nlp
+        model.en_nlp   = en_nlp
+        model.src_stoi = src_stoi
+        model.src_itos = src_itos
+        model.tgt_stoi = tgt_stoi
+        model.tgt_itos = tgt_itos
+
+        # ── Optional checkpoint ───────────────────────────────────────
+        if checkpoint_path and gdrive_file_id:
             try:
                 import gdown
-
                 if not os.path.exists(checkpoint_path):
-                    print("Downloading checkpoint...")
-                    gdown.download(
-                        id=GDRIVE_FILE_ID,
-                        output=checkpoint_path,
-                        quiet=False
-                    )
-
-                ckpt = torch.load(
-                    checkpoint_path,
-                    map_location="cpu"
-                )
-
-                self.load_state_dict(
-                    ckpt["model_state_dict"]
-                )
-
+                    print("Downloading checkpoint…")
+                    gdown.download(id=gdrive_file_id, output=checkpoint_path, quiet=False)
+                ckpt = torch.load(checkpoint_path, map_location="cpu")
+                model.load_state_dict(ckpt["model_state_dict"])
                 print("Weights loaded successfully.")
-
             except Exception as e:
-                print(f"Warning: Could not load checkpoint: {e}")
+                print(f"Warning: could not load checkpoint: {e}")
 
-    # ================================================================
-    # WEIGHT INITIALIZATION
-    # ================================================================
+        return model
 
-    def _init_weights(self):
+    # ──────────────────────────────────────────────────────────────────
+    #  WEIGHT INITIALISATION
+    # ──────────────────────────────────────────────────────────────────
+
+    def _init_weights(self) -> None:
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    # ================================================================
-    # AUTOGRADER HOOKS
-    # ================================================================
+    # ──────────────────────────────────────────────────────────────────
+    #  AUTOGRADER HOOKS
+    # ──────────────────────────────────────────────────────────────────
 
-    def encode(
-        self,
-        src: torch.Tensor,
-        src_mask: torch.Tensor
-    ) -> torch.Tensor:
-
-        x = self.pos_enc(
-            self.src_embed(src) * math.sqrt(self.d_model)
-        )
-
+    def encode(self, src: torch.Tensor, src_mask: torch.Tensor) -> torch.Tensor:
+        """Embed → positional encode → encoder stack."""
+        x = self.pos_enc(self.src_embed(src) * math.sqrt(self.d_model))
         return self.encoder(x, src_mask)
 
     def decode(
@@ -545,18 +524,9 @@ class Transformer(nn.Module):
         tgt:      torch.Tensor,
         tgt_mask: torch.Tensor,
     ) -> torch.Tensor:
-
-        x = self.pos_enc(
-            self.tgt_embed(tgt) * math.sqrt(self.d_model)
-        )
-
-        x = self.decoder(
-            x,
-            memory,
-            src_mask,
-            tgt_mask
-        )
-
+        """Embed → positional encode → decoder stack → output projection."""
+        x = self.pos_enc(self.tgt_embed(tgt) * math.sqrt(self.d_model))
+        x = self.decoder(x, memory, src_mask, tgt_mask)
         return self.output_proj(x)
 
     def forward(
@@ -566,87 +536,57 @@ class Transformer(nn.Module):
         src_mask: torch.Tensor,
         tgt_mask: torch.Tensor,
     ) -> torch.Tensor:
-
         memory = self.encode(src, src_mask)
+        return self.decode(memory, src_mask, tgt, tgt_mask)
 
-        return self.decode(
-            memory,
-            src_mask,
-            tgt,
-            tgt_mask
+    # ──────────────────────────────────────────────────────────────────
+    #  GREEDY INFERENCE
+    # ──────────────────────────────────────────────────────────────────
+
+    def infer(self, src_sentence: str, max_len: int = 150) -> str:
+        """
+        Greedy-decode a German source sentence to English.
+        Requires the model to have been built via `build_from_dataset`
+        so that tokenizers and vocab dicts are populated.
+        """
+        if self.de_nlp is None or not self.src_stoi:
+            raise RuntimeError(
+                "Call Transformer.build_from_dataset() to populate "
+                "tokenizers and vocabularies before running inference."
+            )
+
+        self.eval()
+        device = next(self.parameters()).device
+
+        tokens = [tok.text.lower().strip() for tok in self.de_nlp.tokenizer(src_sentence)]
+        src_indices = (
+            [self.sos_idx]
+            + [self.src_stoi.get(t, UNK_IDX) for t in tokens]
+            + [self.eos_idx]
         )
 
-    # ================================================================
-    # INFERENCE
-    # ================================================================
-        def infer(self, src_sentence: str) -> str:
+        src = torch.tensor(src_indices, dtype=torch.long).unsqueeze(0).to(device)
+        src_mask = make_src_mask(src, self.pad_idx)
 
-          self.eval()
-  
-          device = next(self.parameters()).device
-  
-          tokens = [
-              tok.text.lower().strip()
-              for tok in self.de_nlp.tokenizer(src_sentence)
-          ]
-  
-          src_indices = (
-              [self.sos_idx]
-              + [self.src_stoi.get(t, 0) for t in tokens]
-              + [self.eos_idx]
-          )
-  
-          src = torch.tensor(
-              src_indices,
-              dtype=torch.long
-          ).unsqueeze(0).to(device)
-  
-          src_mask = make_src_mask(src, self.pad_idx)
-  
-          ys = torch.tensor(
-              [[self.sos_idx]],
-              dtype=torch.long,
-              device=device
-          )
-  
-          with torch.no_grad():
-  
-              memory = self.encode(src, src_mask)
-  
-              for _ in range(150):
-  
-                  tgt_mask = make_tgt_mask(
-                      ys,
-                      self.pad_idx
-                  ).to(device)
-  
-                  logits = self.decode(
-                      memory,
-                      src_mask,
-                      ys,
-                      tgt_mask
-                  )
-  
-                  next_tok = logits[:, -1, :].argmax(
-                      dim=-1,
-                      keepdim=True
-                  )
-  
-                  ys = torch.cat([ys, next_tok], dim=1)
-  
-                  if next_tok.item() == self.eos_idx:
-                      break
-  
-          result = []
-  
-          for idx in ys.squeeze(0).tolist()[1:]:
-  
-              if idx == self.eos_idx:
-                  break
-  
-              if idx != self.pad_idx:
-                  result.append(
-                      self.tgt_itos.get(idx, "<unk>")
-                  )
-  
-          return " ".join(result)
+        ys = torch.tensor([[self.sos_idx]], dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            memory = self.encode(src, src_mask)
+
+            for _ in range(max_len):
+                tgt_mask = make_tgt_mask(ys, self.pad_idx).to(device)
+                logits   = self.decode(memory, src_mask, ys, tgt_mask)
+                next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                ys       = torch.cat([ys, next_tok], dim=1)
+
+                if next_tok.item() == self.eos_idx:
+                    break
+
+        result = []
+        for idx in ys.squeeze(0).tolist()[1:]:
+            if idx == self.eos_idx:
+                break
+            if idx != self.pad_idx:
+                result.append(self.tgt_itos.get(idx, "<unk>"))
+
+        return " ".join(result)
