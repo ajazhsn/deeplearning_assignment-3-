@@ -375,8 +375,8 @@ class Transformer(nn.Module):
 
     def __init__(
         self,
-        src_vocab_size: int,
-        tgt_vocab_size: int,
+        src_vocab_size: int = None,
+        tgt_vocab_size: int = None,
         d_model:   int   = 256,
         N:         int   = 3,
         num_heads: int   = 8,
@@ -385,6 +385,20 @@ class Transformer(nn.Module):
         pad_idx:   int   = PAD_IDX,
     ) -> None:
         super().__init__()
+
+        # Auto-build vocab/model when called as Transformer()
+        if src_vocab_size is None or tgt_vocab_size is None:
+            tmp_model = Transformer.build_from_dataset(
+                d_model=d_model,
+                N=N,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                dropout=dropout,
+                checkpoint_path="checkpoint.pt",
+                gdrive_file_id="1R-nnKC_69Vxg-TqTlOMMhirFzbC9oORr",
+            )
+            self.__dict__.update(tmp_model.__dict__)
+            return
 
         self.d_model = d_model
         self.pad_idx = pad_idx
