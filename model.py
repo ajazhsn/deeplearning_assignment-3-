@@ -557,113 +557,83 @@ class Transformer(nn.Module):
     #  BEAM-SEARCH INFERENCE
     # ──────────────────────────────────────────────────────────────────
 
-    def infer(
-        self,
-        src_sentence: str,
-        max_len:   int   = 150,
-        beam_size: int   = 5,
-        length_penalty: float = 0.6,
-    ) -> str:
-        """
-        Beam-search decode a German source sentence to English.
+    def infer(self, src_sentence: str, max_len: int = 150) -> str:
 
-        Args:
-            src_sentence   : raw German text
-            max_len        : maximum output tokens
-            beam_size      : number of beams (5 gives a solid BLEU boost
-                             over greedy with negligible extra cost)
-            length_penalty : Wu et al. LP = ((5 + len) / 6) ^ alpha;
-                             0.6 is the value used in the original paper.
-        """
-        if self.de_nlp is None or not self.src_stoi:
-            raise RuntimeError(
-                "Call Transformer.build_from_dataset() to populate "
-                "tokenizers and vocabularies before running inference."
-            )
-
-        self.eval()
-        device = next(self.parameters()).device
-
-        # ── Encode source ────────────────────────────────────────────
-        tokens = [tok.text.lower().strip() for tok in self.de_nlp.tokenizer(src_sentence)]
-        src_indices = (
-            [self.sos_idx]
-            + [self.src_stoi.get(t, UNK_IDX) for t in tokens]
-            + [self.eos_idx]
-        )
-        src = torch.tensor(src_indices, dtype=torch.long).unsqueeze(0).to(device)
-        src_mask = make_src_mask(src, self.pad_idx)
-
-        with torch.no_grad():
-            memory = self.encode(src, src_mask)  # [1, src_len, d_model]
-
-        # ── Initialise beams ─────────────────────────────────────────
-        # Each beam: (log_prob, token_ids_list)
-        beams = [(0.0, [self.sos_idx])]
-        completed = []
-
-        with torch.no_grad():
-            for _ in range(max_len):
-                candidates = []
-
-                for log_prob, seq in beams:
-                    if seq[-1] == self.eos_idx:
-                        completed.append((log_prob, seq))
-                        continue
-
-                    ys = torch.tensor([seq], dtype=torch.long, device=device)
-                    tgt_mask = make_tgt_mask(ys, self.pad_idx).to(device)
-
-                    # Expand memory to match beam batch dim (still 1 here)
-                    logits = self.decode(memory, src_mask, ys, tgt_mask)
-                    log_probs = F.log_softmax(logits[:, -1, :], dim=-1)  # [1, vocab]
-
-                    # Take top-k next tokens
-                    topk_log_probs, topk_ids = log_probs[0].topk(beam_size)
-
-                    for next_log_p, next_id in zip(
-                        topk_log_probs.tolist(), topk_ids.tolist()
-                    ):
-                        candidates.append((log_prob + next_log_p, seq + [next_id]))
-
-                if not candidates:
-                    break
-
-                # Keep top beam_size by length-normalised score
-                def score(item):
-                    lp, seq = item
-                    length = max(len(seq) - 1, 1)  # exclude <sos>
-                    penalty = ((5 + length) / 6) ** length_penalty
-                    return lp / penalty
-
-                candidates.sort(key=score, reverse=True)
-                beams = candidates[:beam_size]
-
-                # Early-exit if all active beams have ended
-                if all(seq[-1] == self.eos_idx for _, seq in beams):
-                    completed.extend(beams)
-                    beams = []
-                    break
-
-        # ── Pick best completed sequence ──────────────────────────────
-        all_seqs = completed + beams
-        if not all_seqs:
-            return ""
-
-        def score(item):
-            lp, seq = item
-            length = max(len(seq) - 1, 1)
-            penalty = ((5 + length) / 6) ** length_penalty
-            return lp / penalty
-
-        _, best_seq = max(all_seqs, key=score)
-
-        # ── Decode tokens → string ────────────────────────────────────
-        result = []
-        for idx in best_seq[1:]:  # skip <sos>
-            if idx == self.eos_idx:
-                break
-            if idx != self.pad_idx:
-                result.append(self.tgt_itos.get(idx, "<unk>"))
-
-        return " ".join(result)
+      if self.de_nlp is None or not self.src_stoi:
+          raise RuntimeError(
+              "Call Transformer.build_from_dataset() first."
+          )
+  
+      self.eval()
+  
+      device = next(self.parameters()).device
+  
+      tokens = [
+          tok.text.lower().strip()
+          for tok in self.de_nlp.tokenizer(src_sentence)
+      ]
+  
+      src_indices = (
+          [self.sos_idx]
+          + [self.src_stoi.get(t, UNK_IDX) for t in tokens]
+          + [self.eos_idx]
+      )
+  
+      src = torch.tensor(
+          src_indices,
+          dtype=torch.long
+      ).unsqueeze(0).to(device)
+  
+      src_mask = make_src_mask(src, self.pad_idx)
+  
+      ys = torch.tensor(
+          [[self.sos_idx]],
+          dtype=torch.long,
+          device=device
+      )
+  
+      with torch.no_grad():
+  
+          memory = self.encode(src, src_mask)
+  
+          for _ in range(max_len):
+  
+              tgt_mask = make_tgt_mask(
+                  ys,
+                  self.pad_idx
+              ).to(device)
+  
+              logits = self.decode(
+                  memory,
+                  src_mask,
+                  ys,
+                  tgt_mask
+              )
+  
+              temperature = 0.9
+  
+              scaled_logits = logits[:, -1, :] / temperature
+  
+              next_tok = scaled_logits.argmax(
+                  dim=-1,
+                  keepdim=True
+              )
+  
+              ys = torch.cat([ys, next_tok], dim=1)
+  
+              if next_tok.item() == self.eos_idx:
+                  break
+  
+      result = []
+  
+      for idx in ys.squeeze(0).tolist()[1:]:
+  
+          if idx == self.eos_idx:
+              break
+  
+          if idx != self.pad_idx:
+              result.append(
+                  self.tgt_itos.get(idx, "<unk>")
+              )
+  
+      return " ".join(result)
