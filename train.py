@@ -8,6 +8,7 @@ Key changes vs original:
   - warmup_steps 4000 → 2000  (faster warm-up for small dataset)
   - Saves best checkpoint by val BLEU, not val loss
   - Uploads best checkpoint to Google Drive automatically
+  - W&B logging integrated
 """
 
 import math
@@ -16,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+import wandb
 
 # ── pull from your repo ───────────────────────────────────────────────
 import subprocess, sys
@@ -47,7 +49,7 @@ CONFIG = dict(
     label_smooth = 0.1,
     min_freq     = 2,
     max_len      = 128,
-    gdrive_id    = "1R-nnKC_69Vxg-TqTlOMMhirFzbC9oORr",  # existing file id
+    gdrive_id    = "1R-nnKC_69Vxg-TqTlOMMhirFzbC9oORr",
 )
 
 
@@ -72,12 +74,9 @@ def evaluate_bleu_fast(model, test_loader, tgt_vocab, device, max_len=100):
             ys = greedy_decode(model, src, src_mask, max_len,
                                sos_idx, eos_idx, device)
 
-            hyp = [tgt_vocab.itos[i] for i in ys.squeeze(0).tolist()[1:]
-                   if i not in (eos_idx, pad_idx, sos_idx)]
             ref = [tgt_vocab.itos[i] for i in tgt.squeeze(0).tolist()
                    if i not in (eos_idx, pad_idx, sos_idx)]
 
-            # stop hyp at first eos
             ys_list = ys.squeeze(0).tolist()[1:]
             hyp = []
             for i in ys_list:
@@ -98,14 +97,22 @@ def evaluate_bleu_fast(model, test_loader, tgt_vocab, device, max_len=100):
 # ══════════════════════════════════════════════════════════════════════
 
 def main():
+    # ── Init W&B ──────────────────────────────────────────────────────
+    wandb.init(
+        project = "da6401-a3",
+        name    = "optimized_d_ff1024_ep30_warmup2000",
+        config  = CONFIG,
+    )
+    cfg = wandb.config
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}")
 
     # ── Data ──────────────────────────────────────────────────────────
     train_loader, val_loader, test_loader, src_vocab, tgt_vocab = \
-        get_dataloaders(batch_size=CONFIG['batch_size'],
-                        min_freq=CONFIG['min_freq'],
-                        max_len=CONFIG['max_len'])
+        get_dataloaders(batch_size=cfg.batch_size,
+                        min_freq=cfg.min_freq,
+                        max_len=cfg.max_len)
 
     print(f"Src vocab: {len(src_vocab)}  Tgt vocab: {len(tgt_vocab)}")
 
@@ -113,37 +120,39 @@ def main():
     model = Transformer(
         src_vocab_size = len(src_vocab),
         tgt_vocab_size = len(tgt_vocab),
-        d_model   = CONFIG['d_model'],
-        N         = CONFIG['N'],
-        num_heads = CONFIG['num_heads'],
-        d_ff      = CONFIG['d_ff'],
-        dropout   = CONFIG['dropout'],
+        d_model   = cfg.d_model,
+        N         = cfg.N,
+        num_heads = cfg.num_heads,
+        d_ff      = cfg.d_ff,
+        dropout   = cfg.dropout,
         pad_idx   = PAD_IDX,
     ).to(device)
 
-    print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Params: {n_params:,}")
+    wandb.log({"n_params": n_params})
 
     # ── Optimiser & scheduler ──────────────────────────────────────────
     optimizer = torch.optim.Adam(
         model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9
     )
     scheduler = NoamScheduler(optimizer,
-                              d_model=CONFIG['d_model'],
-                              warmup_steps=CONFIG['warmup_steps'])
+                              d_model=cfg.d_model,
+                              warmup_steps=cfg.warmup_steps)
 
     loss_fn = LabelSmoothingLoss(
         vocab_size = len(tgt_vocab),
         pad_idx    = PAD_IDX,
-        smoothing  = CONFIG['label_smooth'],
+        smoothing  = cfg.label_smooth,
     )
 
     # ── Training loop ──────────────────────────────────────────────────
     best_bleu      = 0.0
     best_ckpt_path = "best_checkpoint.pt"
 
-    for epoch in range(CONFIG['num_epochs']):
+    for epoch in range(cfg.num_epochs):
         print(f"\n{'='*55}")
-        print(f"Epoch {epoch+1}/{CONFIG['num_epochs']}")
+        print(f"Epoch {epoch+1}/{cfg.num_epochs}")
 
         train_loss = run_epoch(train_loader, model, loss_fn,
                                optimizer, scheduler,
@@ -156,32 +165,44 @@ def main():
         lr_now = optimizer.param_groups[0]['lr']
         print(f"  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  lr={lr_now:.2e}")
 
-        # Evaluate BLEU every 5 epochs (fast enough on Colab)
-        if (epoch + 1) % 5 == 0 or epoch == CONFIG['num_epochs'] - 1:
+        # ── Log every epoch ───────────────────────────────────────────
+        wandb.log({
+            "epoch":       epoch + 1,
+            "train_loss":  train_loss,
+            "val_loss":    val_loss,
+            "learning_rate": lr_now,
+        })
+
+        # ── BLEU every 5 epochs and on final epoch ────────────────────
+        if (epoch + 1) % 5 == 0 or epoch == cfg.num_epochs - 1:
             bleu = evaluate_bleu_fast(model, test_loader, tgt_vocab, device)
             print(f"  *** Test BLEU = {bleu:.2f} ***")
+
+            wandb.log({
+                "epoch":     epoch + 1,
+                "test_bleu": bleu,
+            })
 
             if bleu > best_bleu:
                 best_bleu = bleu
                 save_checkpoint(model, optimizer, scheduler,
                                 epoch + 1, best_ckpt_path)
                 print(f"  → New best checkpoint saved (BLEU {best_bleu:.2f})")
+                wandb.run.summary["best_bleu"]  = best_bleu
+                wandb.run.summary["best_epoch"] = epoch + 1
 
         # Always save latest
         save_checkpoint(model, optimizer, scheduler, epoch + 1, "checkpoint.pt")
 
-    # ── Upload best checkpoint to Google Drive ─────────────────────────
+    # ── Final summary log ──────────────────────────────────────────────
+    wandb.run.summary["best_bleu"] = best_bleu
     print(f"\nBest BLEU: {best_bleu:.2f}")
     print(f"Best checkpoint: {best_ckpt_path}")
 
+    # ── Upload best checkpoint to Google Drive ─────────────────────────
     try:
-        import gdown
-        # Upload overwrites the existing file by its id
-        # gdown doesn't support upload; use pydrive instead
         from pydrive2.auth import GoogleAuth
         from pydrive2.drive import GoogleDrive
-        from oauth2client.service_account import ServiceAccountCredentials
-
         print("\nTo upload to Drive, run in Colab:")
         print(f"  from google.colab import drive")
         print(f"  drive.mount('/content/drive')")
@@ -191,6 +212,7 @@ def main():
     except Exception:
         pass
 
+    wandb.finish()
     print("\nDone. Copy the checkpoint to Drive and update the GDRIVE_FILE_ID in model.py.")
     return best_bleu
 
