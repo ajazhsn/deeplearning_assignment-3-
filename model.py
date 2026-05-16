@@ -551,13 +551,16 @@ class Transformer(nn.Module):
         return self.decode(memory, src_mask, tgt, tgt_mask)
 
     # ──────────────────────────────────────────────────────────────────
-    #  INFERENCE  (plain greedy — proven 34.94 baseline)
+    #  INFERENCE  (beam-4, max_len=50 — fast enough, better than greedy)
     # ──────────────────────────────────────────────────────────────────
 
-    def infer(self, src_sentence: str, max_len: int = 150) -> str:
+    def infer(self, src_sentence: str, max_len: int = 50) -> str:
         """
-        Plain greedy decode. Runs in ~0.1 s/sentence — well within the
-        3-second autograder limit even for long sequences.
+        Beam search, beam_size=4, max_len=50.
+
+        Multi30k sentences average ~13 tokens; 50 is a safe ceiling.
+        4 beams × 50 steps = 200 decoder calls per sentence, vs greedy's
+        150 — comfortably within the 3-second autograder limit.
         """
         if self.de_nlp is None or not self.src_stoi:
             raise RuntimeError(
@@ -565,15 +568,15 @@ class Transformer(nn.Module):
                 "tokenizers and vocabularies before running inference."
             )
 
-        # Ensure every submodule is in eval mode (disables all dropout)
-        self.eval()
-        for m in self.modules():
-            m.training = False
+        BEAM          = 4
+        LEN_PENALTY   = 0.6
 
+        self.eval()
         device = next(self.parameters()).device
 
-        # ── Tokenise & encode source ─────────────────────────────────
-        tokens = [tok.text.lower().strip() for tok in self.de_nlp.tokenizer(src_sentence)]
+        # ── Tokenise & encode source ──────────────────────────────────
+        tokens = [tok.text.lower().strip()
+                  for tok in self.de_nlp.tokenizer(src_sentence)]
         src_indices = (
             [self.sos_idx]
             + [self.src_stoi.get(t, UNK_IDX) for t in tokens]
@@ -582,21 +585,55 @@ class Transformer(nn.Module):
         src      = torch.tensor(src_indices, dtype=torch.long).unsqueeze(0).to(device)
         src_mask = make_src_mask(src, self.pad_idx)
 
-        ys = torch.tensor([[self.sos_idx]], dtype=torch.long, device=device)
+        with torch.no_grad():
+            memory = self.encode(src, src_mask)          # [1, src_len, d_model]
+
+        def lp_score(log_prob: float, length: int) -> float:
+            return log_prob / (((5 + max(length, 1)) / 6) ** LEN_PENALTY)
+
+        # beams: list of (cumulative_log_prob, token_list)
+        beams     = [(0.0, [self.sos_idx])]
+        completed = []
 
         with torch.no_grad():
-            memory = self.encode(src, src_mask)
-
             for _ in range(max_len):
-                tgt_mask = make_tgt_mask(ys, self.pad_idx)
-                logits   = self.decode(memory, src_mask, ys, tgt_mask)
-                next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                ys       = torch.cat([ys, next_tok], dim=1)
-                if next_tok.item() == self.eos_idx:
+                if not beams:
                     break
+                candidates = []
+
+                for log_prob, seq in beams:
+                    ys       = torch.tensor([seq], dtype=torch.long, device=device)
+                    tgt_mask = make_tgt_mask(ys, self.pad_idx)
+                    logits   = self.decode(memory, src_mask, ys, tgt_mask)
+                    lp_next  = F.log_softmax(logits[:, -1, :], dim=-1)[0]
+
+                    topk_lp, topk_id = lp_next.topk(BEAM)
+                    for lp, tid in zip(topk_lp.tolist(), topk_id.tolist()):
+                        new_seq = seq + [tid]
+                        score   = lp_score(log_prob + lp, len(new_seq) - 1)
+                        candidates.append((log_prob + lp, new_seq, score))
+
+                # sort by length-normalised score, keep top BEAM
+                candidates.sort(key=lambda x: x[2], reverse=True)
+                candidates = candidates[:BEAM]
+
+                beams = []
+                for cum_lp, seq, _ in candidates:
+                    if seq[-1] == self.eos_idx:
+                        completed.append((cum_lp, seq))
+                    else:
+                        beams.append((cum_lp, seq))
+
+        # add any unfinished beams to completed pool
+        completed.extend(beams)
+        if not completed:
+            return ""
+
+        _, best = max(completed,
+                      key=lambda x: lp_score(x[0], len(x[1]) - 1))
 
         result = []
-        for idx in ys.squeeze(0).tolist()[1:]:
+        for idx in best[1:]:           # skip <sos>
             if idx == self.eos_idx:
                 break
             if idx != self.pad_idx:
