@@ -579,130 +579,129 @@ class Transformer(nn.Module):
     # ================================================================
     # INFERENCE
     # ================================================================
-
     def infer(self, src_sentence: str) -> str:
 
-    self.eval()
-
-    device = next(self.parameters()).device
-
-    # Tokenize source sentence
-    tokens = [
-        tok.text.lower().strip()
-        for tok in self.de_nlp.tokenizer(src_sentence)
-    ]
-
-    src_indices = (
-        [self.sos_idx]
-        + [self.src_stoi.get(tok, 0) for tok in tokens]
-        + [self.eos_idx]
-    )
-
-    src = torch.tensor(
-        src_indices,
-        dtype=torch.long
-    ).unsqueeze(0).to(device)
-
-    src_mask = make_src_mask(src, self.pad_idx)
-
-    beam_size = 3
-    max_len = 150
-
-    with torch.no_grad():
-
-        memory = self.encode(src, src_mask)
-
-        # Each beam: (sequence_tensor, score)
-        beams = [
-            (
-                torch.tensor(
-                    [[self.sos_idx]],
-                    dtype=torch.long,
-                    device=device
-                ),
-                0.0
+      self.eval()
+  
+      device = next(self.parameters()).device
+  
+      # Tokenize source sentence
+      tokens = [
+          tok.text.lower().strip()
+          for tok in self.de_nlp.tokenizer(src_sentence)
+      ]
+  
+      src_indices = (
+          [self.sos_idx]
+          + [self.src_stoi.get(tok, 0) for tok in tokens]
+          + [self.eos_idx]
+      )
+  
+      src = torch.tensor(
+          src_indices,
+          dtype=torch.long
+      ).unsqueeze(0).to(device)
+  
+      src_mask = make_src_mask(src, self.pad_idx)
+  
+      beam_size = 3
+      max_len = 150
+  
+      with torch.no_grad():
+  
+          memory = self.encode(src, src_mask)
+  
+          # Each beam: (sequence_tensor, score)
+          beams = [
+              (
+                  torch.tensor(
+                      [[self.sos_idx]],
+                      dtype=torch.long,
+                      device=device
+                  ),
+                  0.0
+              )
+          ]
+  
+          completed = []
+  
+          for _ in range(max_len):
+  
+              new_beams = []
+  
+              for ys, score in beams:
+  
+                  # Stop expanding completed sequences
+                  if ys[0, -1].item() == self.eos_idx:
+                      completed.append((ys, score))
+                      continue
+  
+                  tgt_mask = make_tgt_mask(
+                      ys,
+                      self.pad_idx
+                  ).to(device)
+  
+                  logits = self.decode(
+                      memory,
+                      src_mask,
+                      ys,
+                      tgt_mask
+                  )
+  
+                  log_probs = torch.log_softmax(
+                      logits[:, -1, :],
+                      dim=-1
+                  )
+  
+                  topk_log_probs, topk_indices = torch.topk(
+                      log_probs,
+                      beam_size,
+                      dim=-1
+                  )
+  
+                  for k in range(beam_size):
+  
+                      next_tok = topk_indices[0, k].view(1, 1)
+  
+                      new_seq = torch.cat(
+                          [ys, next_tok],
+                          dim=1
+                      )
+  
+                      new_score = score + topk_log_probs[0, k].item()
+  
+                      new_beams.append(
+                          (new_seq, new_score)
+                      )
+  
+              # Keep best beams
+              beams = sorted(
+                  new_beams,
+                  key=lambda x: x[1],
+                  reverse=True
+              )[:beam_size]
+  
+              if len(beams) == 0:
+                  break
+  
+          completed.extend(beams)
+  
+          best_seq = sorted(
+              completed,
+              key=lambda x: x[1],
+              reverse=True
+          )[0][0]
+  
+      result = []
+  
+      for idx in best_seq.squeeze(0).tolist()[1:]:
+  
+          if idx == self.eos_idx:
+              break
+  
+          if idx != self.pad_idx:
+              result.append(
+                  self.tgt_itos.get(idx, "<unk>")
             )
-        ]
 
-        completed = []
-
-        for _ in range(max_len):
-
-            new_beams = []
-
-            for ys, score in beams:
-
-                # Stop expanding completed sequences
-                if ys[0, -1].item() == self.eos_idx:
-                    completed.append((ys, score))
-                    continue
-
-                tgt_mask = make_tgt_mask(
-                    ys,
-                    self.pad_idx
-                ).to(device)
-
-                logits = self.decode(
-                    memory,
-                    src_mask,
-                    ys,
-                    tgt_mask
-                )
-
-                log_probs = torch.log_softmax(
-                    logits[:, -1, :],
-                    dim=-1
-                )
-
-                topk_log_probs, topk_indices = torch.topk(
-                    log_probs,
-                    beam_size,
-                    dim=-1
-                )
-
-                for k in range(beam_size):
-
-                    next_tok = topk_indices[0, k].view(1, 1)
-
-                    new_seq = torch.cat(
-                        [ys, next_tok],
-                        dim=1
-                    )
-
-                    new_score = score + topk_log_probs[0, k].item()
-
-                    new_beams.append(
-                        (new_seq, new_score)
-                    )
-
-            # Keep best beams
-            beams = sorted(
-                new_beams,
-                key=lambda x: x[1],
-                reverse=True
-            )[:beam_size]
-
-            if len(beams) == 0:
-                break
-
-        completed.extend(beams)
-
-        best_seq = sorted(
-            completed,
-            key=lambda x: x[1],
-            reverse=True
-        )[0][0]
-
-    result = []
-
-    for idx in best_seq.squeeze(0).tolist()[1:]:
-
-        if idx == self.eos_idx:
-            break
-
-        if idx != self.pad_idx:
-            result.append(
-                self.tgt_itos.get(idx, "<unk>")
-            )
-
-    return " ".join(result)
+      return " ".join(result)
