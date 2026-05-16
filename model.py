@@ -475,7 +475,7 @@ class Transformer(nn.Module):
         # 7. DOWNLOAD + LOAD CHECKPOINT
         # ============================================================
 
-        GDRIVE_FILE_ID = "1bThAqOVmSo0X5fvTd_4hdH-_Lv-dx6R_"
+        GDRIVE_FILE_ID = "1R-nnKC_69Vxg-TqTlOMMhirFzbC9oORr"
 
         if (
             checkpoint_path is not None
