@@ -569,7 +569,7 @@ class Transformer(nn.Module):
             )
 
         BEAM          = 4
-        LEN_PENALTY   = 0.6
+        LEN_PENALTY   = 0.0   # no length penalty — raw log-prob wins
 
         self.eval()
         device = next(self.parameters()).device
@@ -589,6 +589,8 @@ class Transformer(nn.Module):
             memory = self.encode(src, src_mask)          # [1, src_len, d_model]
 
         def lp_score(log_prob: float, length: int) -> float:
+            if LEN_PENALTY == 0.0:
+                return log_prob
             return log_prob / (((5 + max(length, 1)) / 6) ** LEN_PENALTY)
 
         # beams: list of (cumulative_log_prob, token_list)
