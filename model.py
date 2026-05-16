@@ -351,7 +351,7 @@ def build_vocab(tokens: list, min_freq: int = 2) -> Tuple[dict, dict]:
     stoi = {tok: i for i, tok in enumerate(_SPECIAL)}
     itos = {i: tok for i, tok in enumerate(_SPECIAL)}
     idx = len(_SPECIAL)
-    for tok, cnt in sorted(counter.items(), key=lambda x: x[1], reverse=True):
+    for tok, cnt in sorted(counter.items()):
         if cnt >= min_freq and tok not in stoi:
             stoi[tok] = idx
             itos[idx] = tok
