@@ -392,7 +392,7 @@ class Transformer(nn.Module):
                 d_ff=d_ff,
                 dropout=dropout,
                 checkpoint_path="checkpoint.pt",
-                gdrive_file_id="1R-nnKC_69Vxg-TqTlOMMhirFzbC9oORr",
+                GDRIVE_FILE_ID: str = "1ZPaP9UQQbCvrGr6F3hqyqb4jYdmNmhJr",
             )
             self.__dict__.update(tmp_model.__dict__)
             return
