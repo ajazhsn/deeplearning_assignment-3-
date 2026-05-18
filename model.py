@@ -392,7 +392,7 @@ class Transformer(nn.Module):
                 d_ff=d_ff,
                 dropout=dropout,
                 checkpoint_path="checkpoint.pt",
-                gdrive_file_id="1ItjaRT-ZnxGQydurpshS6OsbZQ2vBE9Q",
+                gdrive_file_id="1XlLpU7CvVck6GNwId1YazC2pzZ-phPQC",
             )
             self.__dict__.update(tmp_model.__dict__)
             return
@@ -439,7 +439,7 @@ class Transformer(nn.Module):
         d_ff:      int   = 512,
         dropout:   float = 0.1,
         checkpoint_path: Optional[str] = "checkpoint.pt",
-        gdrive_file_id:  Optional[str] = "1ItjaRT-ZnxGQydurpshS6OsbZQ2vBE9Q",
+        gdrive_file_id:  Optional[str] = "1XlLpU7CvVck6GNwId1YazC2pzZ-phPQC",
     ) -> "Transformer":
         """
         Convenience factory that:
