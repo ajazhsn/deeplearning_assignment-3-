@@ -439,7 +439,7 @@ class Transformer(nn.Module):
         d_ff:      int   = 512,
         dropout:   float = 0.1,
         checkpoint_path: Optional[str] = "checkpoint.pt",
-        gdrive_file_id:  Optional[str] = "1R-nnKC_69Vxg-TqTlOMMhirFzbC9oORr",
+        gdrive_file_id:  Optional[str] = "d/1X9SonR8WAZnvra-WwbNxb6OqI0rTv7hR",
     ) -> "Transformer":
         """
         Convenience factory that:
